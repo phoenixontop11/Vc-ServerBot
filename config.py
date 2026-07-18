@@ -59,3 +59,4 @@ def load_config() -> List[BotConfig]:
         configs.append(BotConfig(name=name, token=token, guild_id=guild_id, vc_id=vc_id))
 
     return configs
+ 

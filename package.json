@@ -1,7 +1,7 @@
 {
   "name": "vc-server-bot",
-  "version": "1.0.0",
-  "description": "Production-grade 24/7 Discord Voice Channel Bot",
+  "version": "2.0.0",
+  "description": "Production-grade 24/7 Discord Voice Channel presence bot for Railway",
   "type": "module",
   "main": "src/index.js",
   "scripts": {

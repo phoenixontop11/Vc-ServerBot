@@ -15,24 +15,28 @@
  *
  * Race-condition safety:
  *   Every connection attempt is tagged with an incrementing "epoch".
- *   Async work (entersState, timers, event handlers) captures the epoch
- *   that was current when it started. Before that work is allowed to
- *   mutate state, it checks its captured epoch against the current one.
- *   Any attempt started after it - or a stop() call - bumps the epoch,
- *   which silently retires all in-flight work from earlier attempts.
- *   This is what prevents duplicate reconnects, ghost connections, and
- *   half-open sessions from stacking on top of each other.
+ *   Async work (entersState, timers, event handlers) captures the
+ *   epoch that was current when it started. Before that work is
+ *   allowed to mutate state, it checks its captured epoch against the
+ *   current one. Any attempt started after it - or a stop() call -
+ *   bumps the epoch, retiring all in-flight work from earlier
+ *   attempts. This prevents duplicate reconnects, ghost connections,
+ *   and half-open sessions from stacking on top of each other.
  *
- * Soft-timeout handling for the initial handshake:
- *   @discordjs/voice's entersState() throws an AbortError the instant
- *   its timeout elapses, even if the connection is still legitimately
- *   negotiating (Connecting/Signalling) rather than actually stuck.
- *   Destroying the connection at that exact moment is what causes the
- *   "briefly joins then disconnects" symptom - the handshake was about
- *   to succeed and got torn down out from under itself. See
- *   _waitForReady() below: on timeout we inspect the connection's real
- *   status and, if it is still making progress, extend the wait
- *   instead of destroying it, up to an overall cap.
+ * Disconnected-event handling:
+ *   On Disconnected we never wait to *enter* an intermediate status
+ *   (e.g. Signalling) - that status can already have been passed
+ *   through by the time our handler runs, causing the wait to never
+ *   resolve and a healthy, already-Ready connection to be destroyed.
+ *   Instead we check for Ready immediately, wait for Ready itself if
+ *   not already there, and re-check Ready once more before ever
+ *   destroying anything.
+ *
+ * Watchdog:
+ *   Uses guild.voiceStates.cache (gateway-fed, real-time) instead of a
+ *   REST member fetch. A resync is only forced when BOTH the cached
+ *   voice state and the local VoiceConnection status agree the
+ *   connection is broken, and never while CONNECTING/RECONNECTING.
  */
 
 import {
@@ -54,19 +58,28 @@ export const VoiceManagerState = Object.freeze({
     STOPPED: "STOPPED"
 });
 
-// How long we extend the wait each time entersState(Ready) times out but
-// the connection is still visibly negotiating (Connecting/Signalling).
+// How long we extend the wait each time entersState(Ready) times out
+// during the *initial* handshake but the connection is still visibly
+// negotiating (Connecting/Signalling).
 const SOFT_TIMEOUT_EXTENSION_MS = 25_000;
 
-// Hard ceiling on total time spent waiting for the initial handshake
-// across all soft-timeout extensions. Past this, a connection that is
-// still "negotiating" is treated as genuinely stalled.
+// Hard ceiling on total time spent waiting for the *initial* handshake
+// across all soft-timeout extensions.
 const MAX_CONNECT_WAIT_MS = 90_000;
 
 const NEGOTIATING_STATUSES = new Set([
     VoiceConnectionStatus.Connecting,
     VoiceConnectionStatus.Signalling
 ]);
+
+// Distinguishes why a reconnect/resync was triggered, for diagnostics.
+const ReconnectTrigger = Object.freeze({
+    CONNECT_FAILURE: "connect() failure",
+    DISCONNECTED_EVENT: "Disconnected event",
+    DESTROYED_EVENT: "Destroyed event",
+    WATCHDOG: "watchdog",
+    MANUAL_RESYNC: "manual resync"
+});
 
 class VoiceManager {
     constructor(client) {
@@ -89,6 +102,14 @@ class VoiceManager {
         // Prevents the watchdog from fighting with a resync that is
         // already in flight.
         this.lastForcedResyncAt = 0;
+
+        // Set just before we intentionally call connection.destroy()
+        // ourselves. The resulting synchronous Destroyed event checks
+        // this flag so an intentional teardown can never recursively
+        // trigger a second, redundant reconnect - the caller of
+        // _destroyConnection() is always the one responsible for
+        // calling _scheduleReconnect() afterwards, exactly once.
+        this._expectingDestroyedEvent = false;
     }
 
     // ---------------------------------------------------------------
@@ -190,6 +211,10 @@ class VoiceManager {
                 return;
             }
 
+            this._logReconnectTrigger(ReconnectTrigger.CONNECT_FAILURE, {
+                connectionStatus: this.connection?.state?.status
+            });
+
             Logger.error("Voice connection attempt failed.", error);
             this._destroyConnection();
             this._scheduleReconnect();
@@ -197,16 +222,8 @@ class VoiceManager {
     }
 
     /**
-     * Waits for the connection to reach Ready, tolerating soft timeouts.
-     *
-     * entersState() throws as soon as its own timeout elapses, which
-     * does not necessarily mean the handshake failed - it may simply
-     * still be in progress. On timeout we check the connection's actual
-     * status: if it is still Connecting or Signalling (i.e. genuinely
-     * making progress rather than stuck), we extend the wait instead of
-     * giving up immediately. We only surface a real failure once the
-     * connection is no longer negotiating, or the overall time budget
-     * (MAX_CONNECT_WAIT_MS) is exhausted.
+     * Waits for the connection to reach Ready, tolerating soft timeouts
+     * *during the initial handshake only*.
      */
     async _waitForReady(connection, myEpoch) {
         const startedAt = Date.now();
@@ -217,8 +234,6 @@ class VoiceManager {
                 await entersState(connection, VoiceConnectionStatus.Ready, timeoutMs);
                 return;
             } catch (error) {
-                // A newer attempt or a stop() superseded us mid-wait -
-                // bail out quietly, the caller will no-op on stale epoch.
                 if (!this._isCurrentEpoch(myEpoch)) {
                     throw error;
                 }
@@ -241,9 +256,6 @@ class VoiceManager {
                     continue;
                 }
 
-                // Either genuinely stalled (not negotiating anymore) or
-                // we've exhausted the total time budget. Let the caller
-                // handle the real failure.
                 throw error;
             }
         }
@@ -287,59 +299,66 @@ class VoiceManager {
                     return;
                 }
 
-                Logger.warn("Voice connection disconnected.");
+                const reason = newState.reason;
+                const closeCode = newState.closeCode;
+
+                Logger.warn(
+                    `Voice connection disconnected. reason=${reason ?? "unknown"}, closeCode=${closeCode ?? "n/a"}, currentStatus=${connection.state.status}`
+                );
+
+                // Fast-path: did we already self-heal? Never wait to
+                // *enter* an intermediate status - it may already have
+                // been passed through. Check Ready directly, first.
+                if (connection.state.status === VoiceConnectionStatus.Ready) {
+                    Logger.success(
+                        "Voice connection had already self-recovered to Ready before we intervened - no action needed."
+                    );
+                    return;
+                }
 
                 try {
                     const isWebsocketClose =
-                        newState.reason ===
-                        VoiceConnectionDisconnectReason.WebSocketClose;
+                        reason === VoiceConnectionDisconnectReason.WebSocketClose;
 
-                    // Close code 4014 means the bot was removed from the
-                    // channel, the channel was deleted, or the guild lost
-                    // the ability to connect (e.g. permission change) -
-                    // OR it can be a voice server migration in disguise.
-                    // @discordjs/voice will not always recover from this
-                    // on its own, so we wait briefly in case the session
-                    // resumes, then fall through to a clean reconnect.
-                    if (isWebsocketClose && newState.closeCode === 4014) {
+                    if (isWebsocketClose && closeCode === 4014) {
                         Logger.warn(
-                            "Close code 4014 detected - waiting to see if this is a voice server migration rather than a real removal."
+                            "Close code 4014 detected - waiting to confirm whether this is a voice server migration or a real removal."
                         );
-
-                        await entersState(
-                            connection,
-                            VoiceConnectionStatus.Connecting,
-                            config.voice.recoveryWindowMs
-                        );
-
-                        if (this._isCurrentEpoch(myEpoch)) {
-                            Logger.success(
-                                "Voice connection recovered after migration (4014)."
-                            );
-                        }
-
-                        return;
                     }
 
-                    // Transient blip (gateway resume, brief network
-                    // hiccup): give @discordjs/voice a short window to
-                    // self-heal before we intervene.
+                    // Wait for the actual target we care about - Ready -
+                    // using the existing recoveryWindowMs. entersState()
+                    // resolves immediately if already Ready.
                     await entersState(
                         connection,
-                        VoiceConnectionStatus.Signalling,
+                        VoiceConnectionStatus.Ready,
                         config.voice.recoveryWindowMs
                     );
 
                     if (this._isCurrentEpoch(myEpoch)) {
-                        Logger.success("Voice connection self-recovered.");
+                        Logger.success("Voice connection self-recovered to Ready.");
                     }
                 } catch {
                     if (!this._isCurrentEpoch(myEpoch)) {
                         return;
                     }
 
+                    // Final Ready check before ever destroying anything.
+                    if (connection.state.status === VoiceConnectionStatus.Ready) {
+                        Logger.success(
+                            "Voice connection reached Ready just as the recovery wait ended - no action needed."
+                        );
+                        return;
+                    }
+
+                    this._logReconnectTrigger(ReconnectTrigger.DISCONNECTED_EVENT, {
+                        connectionStatus: connection.state.status,
+                        reason,
+                        closeCode
+                    });
+
                     Logger.warn(
-                        "Voice connection did not self-recover in time. Reconnecting."
+                        "Voice connection did not recover to Ready in time. Reconnecting."
                     );
 
                     this._destroyConnection();
@@ -353,11 +372,29 @@ class VoiceManager {
                 return;
             }
 
-            Logger.warn("Voice connection destroyed.");
-
             if (this.connection === connection) {
                 this.connection = null;
             }
+
+            const wasExpected = this._expectingDestroyedEvent;
+            this._expectingDestroyedEvent = false;
+
+            if (wasExpected) {
+                // The code path that called _destroyConnection() already
+                // owns calling _scheduleReconnect() itself. Destroying a
+                // connection must never recursively trigger a second,
+                // independent reconnect here.
+                Logger.debug(
+                    "Voice connection Destroyed event fired as an expected result of an intentional teardown - already handled by the caller."
+                );
+                return;
+            }
+
+            this._logReconnectTrigger(ReconnectTrigger.DESTROYED_EVENT, {
+                connectionStatus: VoiceConnectionStatus.Destroyed
+            });
+
+            Logger.warn("Voice connection destroyed unexpectedly.");
 
             if (!this._isTerminal()) {
                 this._scheduleReconnect();
@@ -428,11 +465,16 @@ class VoiceManager {
      * Verifies actual Discord-side state (not just our local objects)
      * and forces a resync if reality has drifted from what we expect.
      *
-     * Never interrupts CONNECTING or RECONNECTING: a connection that is
-     * still negotiating its initial handshake, or waiting out a backoff
-     * delay, must be left alone. Interrupting it here would race with
-     * connect() and reintroduce the exact "briefly joins then
-     * disconnects" bug this file exists to prevent.
+     * Uses the gateway-cached voice state (guild.voiceStates.cache,
+     * populated in real time by VOICE_STATE_UPDATE events received via
+     * the GuildVoiceStates intent) instead of a REST member fetch.
+     *
+     * Never interrupts CONNECTING or RECONNECTING.
+     *
+     * Only forces a resync when BOTH the cached voice state AND the
+     * connection object itself agree something is wrong - a single
+     * disagreeing signal is never acted on, so a momentarily-stale read
+     * of either source can never tear down a healthy connection.
      */
     async healthCheck() {
         if (this._isTerminal()) {
@@ -459,53 +501,58 @@ class VoiceManager {
             return;
         }
 
-        let botMember;
+        const cachedVoiceState = this.guild.voiceStates.cache.get(
+            this.client.user.id
+        );
+        const actualChannelId = cachedVoiceState?.channelId ?? null;
+        const channelMismatch = actualChannelId !== this.channel.id;
 
-        try {
-            botMember = await this.guild.members.fetch({
-                user: this.client.user.id,
-                force: true
-            });
-        } catch (error) {
-            Logger.error(
-                "Health check failed: could not fetch bot member.",
-                error
-            );
-            return;
-        }
-
-        const actualChannelId = botMember.voice.channelId ?? null;
-
-        if (actualChannelId !== this.channel.id) {
-            Logger.warn(
-                `Health check: bot is not in the target voice channel (found: ${actualChannelId ?? "none"}).`
-            );
-            this._forceResync();
-            return;
-        }
-
-        if (
+        const connectionUnhealthy =
             !this.connection ||
-            this.connection.state.status !== VoiceConnectionStatus.Ready
-        ) {
-            Logger.warn(
-                "Health check: Discord reports the bot in-channel (ghost connection) - local voice connection is missing or not ready. Repairing."
-            );
-            this._forceResync();
+            this.connection.state.status !== VoiceConnectionStatus.Ready;
+
+        if (!channelMismatch && !connectionUnhealthy) {
+            Logger.debug("Health check passed: connection is healthy.");
             return;
         }
 
-        Logger.debug("Health check passed.");
+        if (channelMismatch && connectionUnhealthy) {
+            Logger.warn(
+                `Health check: bot is not in the target voice channel (found: ${actualChannelId ?? "none"}) AND the local voice connection is missing or not ready. Repairing.`
+            );
+            this._forceResync(ReconnectTrigger.WATCHDOG);
+            return;
+        }
+
+        // Only one signal disagrees - log it for visibility, but do not
+        // act. A healthy Ready connection is never destroyed on a
+        // single, possibly-stale signal.
+        if (channelMismatch) {
+            Logger.debug(
+                `Health check: cached voice state reports channel ${actualChannelId ?? "none"}, but the connection object still looks healthy (status=${this.connection.state.status}). Not acting on a single signal - will re-check next tick.`
+            );
+        } else {
+            Logger.debug(
+                `Health check: connection object is not Ready (status=${this.connection?.state?.status ?? "none"}), but cached voice state still shows the bot in the target channel. Not acting on a single signal - will re-check next tick.`
+            );
+        }
     }
 
-    _forceResync() {
+    /**
+     * Public entry point for an operator-triggered resync (e.g. from an
+     * admin command), distinct from the watchdog's automatic one purely
+     * for diagnostic labeling.
+     */
+    requestManualResync() {
+        this._forceResync(ReconnectTrigger.MANUAL_RESYNC);
+    }
+
+    _forceResync(trigger) {
         if (this._isTerminal()) {
             return;
         }
 
-        // Redundant with the guard in healthCheck(), kept here too since
-        // _forceResync() could in principle be called from elsewhere in
-        // the future - it must never preempt an in-progress attempt.
+        // Never preempt an in-progress attempt.
         if (
             this.state === VoiceManagerState.CONNECTING ||
             this.state === VoiceManagerState.RECONNECTING
@@ -528,6 +575,10 @@ class VoiceManager {
         this.lastForcedResyncAt = now;
         this._clearReconnectTimer();
 
+        this._logReconnectTrigger(trigger, {
+            connectionStatus: this.connection?.state?.status
+        });
+
         Logger.warn("Forcing voice resync.");
 
         this.connect().catch((error) => {
@@ -539,18 +590,59 @@ class VoiceManager {
     // Internal helpers
     // ---------------------------------------------------------------
 
+    /**
+     * Rich diagnostic line emitted immediately before any action that
+     * destroys and/or reconnects the voice connection: trigger source,
+     * current VoiceConnectionStatus, current state machine state,
+     * disconnect reason, close code, and the upcoming reconnect attempt
+     * number.
+     */
+    _logReconnectTrigger(trigger, { connectionStatus, reason, closeCode } = {}) {
+        const parts = [
+            `trigger="${trigger}"`,
+            `machineState=${this.state}`,
+            `connectionStatus=${connectionStatus ?? "none"}`,
+            `nextReconnectAttempt=${this.reconnectAttempts + 1}`
+        ];
+
+        if (reason !== undefined) {
+            parts.push(`disconnectReason=${reason}`);
+        }
+
+        if (closeCode !== undefined) {
+            parts.push(`closeCode=${closeCode}`);
+        }
+
+        Logger.warn(`[RECONNECT TRIGGERED] ${parts.join(", ")}`);
+    }
+
     _destroyConnection() {
         if (!this.connection) {
             return;
         }
 
         try {
-            this.connection.removeAllListeners();
+            this._expectingDestroyedEvent = true;
+
+            this.connection.removeAllListeners(VoiceConnectionStatus.Ready);
+            this.connection.removeAllListeners(VoiceConnectionStatus.Connecting);
+            this.connection.removeAllListeners(VoiceConnectionStatus.Signalling);
+            this.connection.removeAllListeners(VoiceConnectionStatus.Disconnected);
+            this.connection.removeAllListeners("error");
+            // Deliberately NOT removing Destroyed listeners here - our
+            // own Destroyed handler above must still observe the
+            // teardown it is about to cause, so it can correctly
+            // recognize it as expected via _expectingDestroyedEvent and
+            // avoid recursively scheduling a second reconnect.
 
             if (this.connection.state.status !== VoiceConnectionStatus.Destroyed) {
                 this.connection.destroy();
+            } else {
+                this.connection.removeAllListeners(VoiceConnectionStatus.Destroyed);
+                this._expectingDestroyedEvent = false;
             }
         } catch (error) {
+            this._expectingDestroyedEvent = false;
             Logger.debug(
                 `Ignoring error while destroying stale connection: ${error?.message ?? error}`
             );

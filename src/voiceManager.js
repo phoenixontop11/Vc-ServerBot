@@ -22,6 +22,17 @@
  *   which silently retires all in-flight work from earlier attempts.
  *   This is what prevents duplicate reconnects, ghost connections, and
  *   half-open sessions from stacking on top of each other.
+ *
+ * Soft-timeout handling for the initial handshake:
+ *   @discordjs/voice's entersState() throws an AbortError the instant
+ *   its timeout elapses, even if the connection is still legitimately
+ *   negotiating (Connecting/Signalling) rather than actually stuck.
+ *   Destroying the connection at that exact moment is what causes the
+ *   "briefly joins then disconnects" symptom - the handshake was about
+ *   to succeed and got torn down out from under itself. See
+ *   _waitForReady() below: on timeout we inspect the connection's real
+ *   status and, if it is still making progress, extend the wait
+ *   instead of destroying it, up to an overall cap.
  */
 
 import {
@@ -42,6 +53,20 @@ export const VoiceManagerState = Object.freeze({
     STOPPING: "STOPPING",
     STOPPED: "STOPPED"
 });
+
+// How long we extend the wait each time entersState(Ready) times out but
+// the connection is still visibly negotiating (Connecting/Signalling).
+const SOFT_TIMEOUT_EXTENSION_MS = 25_000;
+
+// Hard ceiling on total time spent waiting for the initial handshake
+// across all soft-timeout extensions. Past this, a connection that is
+// still "negotiating" is treated as genuinely stalled.
+const MAX_CONNECT_WAIT_MS = 90_000;
+
+const NEGOTIATING_STATUSES = new Set([
+    VoiceConnectionStatus.Connecting,
+    VoiceConnectionStatus.Signalling
+]);
 
 class VoiceManager {
     constructor(client) {
@@ -147,11 +172,7 @@ class VoiceManager {
             this.connection = connection;
             this._registerConnectionEvents(connection, myEpoch);
 
-            await entersState(
-                connection,
-                VoiceConnectionStatus.Ready,
-                config.voice.readyTimeoutMs
-            );
+            await this._waitForReady(connection, myEpoch);
 
             if (!this._isCurrentEpoch(myEpoch)) {
                 // A newer attempt (or a stop()) superseded this one while
@@ -172,6 +193,59 @@ class VoiceManager {
             Logger.error("Voice connection attempt failed.", error);
             this._destroyConnection();
             this._scheduleReconnect();
+        }
+    }
+
+    /**
+     * Waits for the connection to reach Ready, tolerating soft timeouts.
+     *
+     * entersState() throws as soon as its own timeout elapses, which
+     * does not necessarily mean the handshake failed - it may simply
+     * still be in progress. On timeout we check the connection's actual
+     * status: if it is still Connecting or Signalling (i.e. genuinely
+     * making progress rather than stuck), we extend the wait instead of
+     * giving up immediately. We only surface a real failure once the
+     * connection is no longer negotiating, or the overall time budget
+     * (MAX_CONNECT_WAIT_MS) is exhausted.
+     */
+    async _waitForReady(connection, myEpoch) {
+        const startedAt = Date.now();
+        let timeoutMs = config.voice.readyTimeoutMs;
+
+        for (;;) {
+            try {
+                await entersState(connection, VoiceConnectionStatus.Ready, timeoutMs);
+                return;
+            } catch (error) {
+                // A newer attempt or a stop() superseded us mid-wait -
+                // bail out quietly, the caller will no-op on stale epoch.
+                if (!this._isCurrentEpoch(myEpoch)) {
+                    throw error;
+                }
+
+                const status = connection.state.status;
+                const elapsed = Date.now() - startedAt;
+                const stillNegotiating = NEGOTIATING_STATUSES.has(status);
+                const budgetRemaining = elapsed < MAX_CONNECT_WAIT_MS;
+
+                if (stillNegotiating && budgetRemaining) {
+                    Logger.warn(
+                        `Ready timeout hit, but connection is still "${status}" after ${Math.round(elapsed / 1000)}s. Extending wait instead of tearing it down.`
+                    );
+
+                    timeoutMs = Math.min(
+                        SOFT_TIMEOUT_EXTENSION_MS,
+                        MAX_CONNECT_WAIT_MS - elapsed
+                    );
+
+                    continue;
+                }
+
+                // Either genuinely stalled (not negotiating anymore) or
+                // we've exhausted the total time budget. Let the caller
+                // handle the real failure.
+                throw error;
+            }
         }
     }
 
@@ -221,13 +295,17 @@ class VoiceManager {
                         VoiceConnectionDisconnectReason.WebSocketClose;
 
                     // Close code 4014 means the bot was removed from the
-                    // channel, or the channel was deleted, or the guild
-                    // lost the ability to connect (e.g. permission
-                    // change). @discordjs/voice will not recover from
-                    // this on its own, so we wait briefly in case it is a
-                    // voice server migration, then fall through to a
-                    // clean reconnect.
+                    // channel, the channel was deleted, or the guild lost
+                    // the ability to connect (e.g. permission change) -
+                    // OR it can be a voice server migration in disguise.
+                    // @discordjs/voice will not always recover from this
+                    // on its own, so we wait briefly in case the session
+                    // resumes, then fall through to a clean reconnect.
                     if (isWebsocketClose && newState.closeCode === 4014) {
+                        Logger.warn(
+                            "Close code 4014 detected - waiting to see if this is a voice server migration rather than a real removal."
+                        );
+
                         await entersState(
                             connection,
                             VoiceConnectionStatus.Connecting,
@@ -236,7 +314,7 @@ class VoiceManager {
 
                         if (this._isCurrentEpoch(myEpoch)) {
                             Logger.success(
-                                "Voice connection recovered after migration."
+                                "Voice connection recovered after migration (4014)."
                             );
                         }
 
@@ -349,9 +427,25 @@ class VoiceManager {
     /**
      * Verifies actual Discord-side state (not just our local objects)
      * and forces a resync if reality has drifted from what we expect.
+     *
+     * Never interrupts CONNECTING or RECONNECTING: a connection that is
+     * still negotiating its initial handshake, or waiting out a backoff
+     * delay, must be left alone. Interrupting it here would race with
+     * connect() and reintroduce the exact "briefly joins then
+     * disconnects" bug this file exists to prevent.
      */
     async healthCheck() {
         if (this._isTerminal()) {
+            return;
+        }
+
+        if (
+            this.state === VoiceManagerState.CONNECTING ||
+            this.state === VoiceManagerState.RECONNECTING
+        ) {
+            Logger.debug(
+                `Health check skipped: connection is currently ${this.state}.`
+            );
             return;
         }
 
@@ -395,7 +489,7 @@ class VoiceManager {
             this.connection.state.status !== VoiceConnectionStatus.Ready
         ) {
             Logger.warn(
-                "Health check: Discord reports the bot in-channel, but the local voice connection is missing or not ready."
+                "Health check: Discord reports the bot in-channel (ghost connection) - local voice connection is missing or not ready. Repairing."
             );
             this._forceResync();
             return;
@@ -409,17 +503,25 @@ class VoiceManager {
             return;
         }
 
+        // Redundant with the guard in healthCheck(), kept here too since
+        // _forceResync() could in principle be called from elsewhere in
+        // the future - it must never preempt an in-progress attempt.
+        if (
+            this.state === VoiceManagerState.CONNECTING ||
+            this.state === VoiceManagerState.RECONNECTING
+        ) {
+            Logger.debug(
+                `Skipping forced resync: connection is currently ${this.state}.`
+            );
+            return;
+        }
+
         // Do not force more than once per watchdog interval; an attempt
         // may already be in flight from the previous tick.
         const now = Date.now();
 
         if (now - this.lastForcedResyncAt < config.watchdog.intervalMs) {
             Logger.debug("Skipping forced resync: one is already recent.");
-            return;
-        }
-
-        if (this.state === VoiceManagerState.CONNECTING) {
-            Logger.debug("Skipping forced resync: a connect is in progress.");
             return;
         }
 

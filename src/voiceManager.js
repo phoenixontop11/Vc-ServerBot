@@ -24,13 +24,22 @@
  *   and half-open sessions from stacking on top of each other.
  *
  * Disconnected-event handling:
- *   On Disconnected we never wait to *enter* an intermediate status
- *   (e.g. Signalling) - that status can already have been passed
- *   through by the time our handler runs, causing the wait to never
- *   resolve and a healthy, already-Ready connection to be destroyed.
- *   Instead we check for Ready immediately, wait for Ready itself if
- *   not already there, and re-check Ready once more before ever
- *   destroying anything.
+ *   Mirrors the official @discordjs/voice "Handling disconnects" guide
+ *   and the library's own VoiceConnection.onNetworkingClose behaviour.
+ *   On Disconnected we wait for the library's self-heal signals -
+ *   Signalling OR Connecting (OR Ready, as a fast-path) - within
+ *   recoveryWindowMs. The library transitions Disconnected -> Signalling
+ *   on its own for any non-4014 websocket close and attempts a rejoin;
+ *   it does NOT go straight back to Ready from Disconnected, so waiting
+ *   for Ready (the previous implementation) would always time out and
+ *   destroy a connection that was actively recovering.
+ *
+ *   Only after the wait fails AND the connection is still in a
+ *   Disconnected state do we treat it as a real, non-recoverable
+ *   disconnect and tear it down + schedule a reconnect. A Disconnected
+ *   event that the library self-heals (Signalling/Connecting/Ready
+ *   observed in time) results in zero action - the healthy connection
+ *   is never destroyed.
  *
  * Watchdog:
  *   Uses guild.voiceStates.cache (gateway-fed, real-time) instead of a
@@ -306,64 +315,124 @@ class VoiceManager {
                     `Voice connection disconnected. reason=${reason ?? "unknown"}, closeCode=${closeCode ?? "n/a"}, currentStatus=${connection.state.status}`
                 );
 
-                // Fast-path: did we already self-heal? Never wait to
-                // *enter* an intermediate status - it may already have
-                // been passed through. Check Ready directly, first.
-                if (connection.state.status === VoiceConnectionStatus.Ready) {
+                // Fast-path: did we already self-heal to Ready, or did the
+                // library already move on to Signalling/Connecting (its own
+                // automatic rejoin/resume)? Any of these means the library
+                // is handling recovery and we must NOT destroy the
+                // connection. entersState() below resolves immediately if
+                // the target status is already current.
+                const currentStatus = connection.state.status;
+                if (
+                    currentStatus === VoiceConnectionStatus.Ready ||
+                    currentStatus === VoiceConnectionStatus.Signalling ||
+                    currentStatus === VoiceConnectionStatus.Connecting
+                ) {
                     Logger.success(
-                        "Voice connection had already self-recovered to Ready before we intervened - no action needed."
+                        `Voice connection had already self-recovered (status=${currentStatus}) before we intervened - no action needed.`
                     );
                     return;
                 }
 
-                try {
-                    const isWebsocketClose =
-                        reason === VoiceConnectionDisconnectReason.WebSocketClose;
+                const isWebsocketClose =
+                    reason === VoiceConnectionDisconnectReason.WebSocketClose;
 
-                    if (isWebsocketClose && closeCode === 4014) {
-                        Logger.warn(
-                            "Close code 4014 detected - waiting to confirm whether this is a voice server migration or a real removal."
-                        );
-                    }
-
-                    // Wait for the actual target we care about - Ready -
-                    // using the existing recoveryWindowMs. entersState()
-                    // resolves immediately if already Ready.
-                    await entersState(
-                        connection,
-                        VoiceConnectionStatus.Ready,
-                        config.voice.recoveryWindowMs
-                    );
-
-                    if (this._isCurrentEpoch(myEpoch)) {
-                        Logger.success("Voice connection self-recovered to Ready.");
-                    }
-                } catch {
-                    if (!this._isCurrentEpoch(myEpoch)) {
-                        return;
-                    }
-
-                    // Final Ready check before ever destroying anything.
-                    if (connection.state.status === VoiceConnectionStatus.Ready) {
-                        Logger.success(
-                            "Voice connection reached Ready just as the recovery wait ended - no action needed."
-                        );
-                        return;
-                    }
-
-                    this._logReconnectTrigger(ReconnectTrigger.DISCONNECTED_EVENT, {
-                        connectionStatus: connection.state.status,
-                        reason,
-                        closeCode
-                    });
-
+                if (isWebsocketClose && closeCode === 4014) {
                     Logger.warn(
-                        "Voice connection did not recover to Ready in time. Reconnecting."
+                        "Close code 4014 detected - server-requested disconnect. Waiting briefly to confirm it is not a voice server migration."
                     );
-
-                    this._destroyConnection();
-                    this._scheduleReconnect();
                 }
+
+                // Wait for the library's self-heal signals - exactly as
+                // the official guide prescribes: race Signalling and
+                // Connecting (the states the library transitions to when
+                // it auto-rejoins/resumes), plus Ready as an immediate
+                // resolution if it is already there. We deliberately do
+                // NOT wait for Ready alone: from Disconnected the library
+                // goes to Signalling/Connecting first, never straight to
+                // Ready, so a Ready-only wait would always time out and
+                // destroy a recovering connection.
+                //
+                // A shared AbortController + single timeout drives all
+                // three waits. The moment any one resolves, the others
+                // are aborted (dropping their listeners + timers) via the
+                // finally block. Losers' AbortErrors are swallowed by the
+                // .catch(() => null); a null result means "all three
+                // timed out / aborted" -> genuine disconnect.
+                const recoveryController = new AbortController();
+                const recoveryTimer = setTimeout(
+                    () => recoveryController.abort(),
+                    config.voice.recoveryWindowMs
+                );
+                recoveryTimer.unref?.();
+
+                const waitFor = (status) =>
+                    entersState(
+                        connection,
+                        status,
+                        recoveryController.signal
+                    ).catch(() => null);
+
+                let recovered = false;
+
+                try {
+                    const winner = await Promise.race([
+                        waitFor(VoiceConnectionStatus.Signalling),
+                        waitFor(VoiceConnectionStatus.Connecting),
+                        waitFor(VoiceConnectionStatus.Ready)
+                    ]);
+                    recovered = winner !== null;
+                } catch (error) {
+                    // waitFor() swallows AbortError -> null, so an
+                    // exception reaching here is something unexpected
+                    // (e.g. the connection was destroyed mid-wait).
+                    // Treat it as "did not self-heal" and fall through
+                    // to the disconnect-status check below.
+                    Logger.debug(
+                        `Recovery wait threw unexpectedly: ${error?.message ?? error}`
+                    );
+                    recovered = false;
+                } finally {
+                    recoveryController.abort();
+                    clearTimeout(recoveryTimer);
+                }
+
+                if (!this._isCurrentEpoch(myEpoch)) {
+                    return;
+                }
+
+                if (recovered) {
+                    Logger.success(
+                        "Voice connection self-recovered (transitioned out of Disconnected) - no action needed."
+                    );
+                    return;
+                }
+
+                // All three races timed out / aborted. Only tear down if
+                // the connection is STILL in the Disconnected state - i.e.
+                // the library did not self-heal. If it moved to Signalling/
+                // Connecting/Ready in the meantime, the library is handling
+                // recovery and we must not interfere.
+                const statusAfterWait = connection.state.status;
+
+                if (statusAfterWait !== VoiceConnectionStatus.Disconnected) {
+                    Logger.success(
+                        `Voice connection left the Disconnected state (now ${statusAfterWait}) during the recovery window - no action needed.`
+                    );
+                    return;
+                }
+
+                this._logReconnectTrigger(ReconnectTrigger.DISCONNECTED_EVENT, {
+                    connectionStatus: statusAfterWait,
+                    reason,
+                    closeCode
+                });
+
+                Logger.warn(
+                    "Voice connection did not self-recover from Disconnected in time. Reconnecting."
+                );
+
+                this._destroyConnection();
+                this._scheduleReconnect();
             }
         );
 

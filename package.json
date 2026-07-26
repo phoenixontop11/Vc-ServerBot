@@ -1,0 +1,19 @@
+{
+  "name": "vc-server-bot",
+  "version": "1.0.0",
+  "description": "Production-grade 24/7 Discord Voice Channel Server Bot",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.18.0",
+    "discord.js": "^14.21.0",
+    "dotenv": "^16.6.1"
+  }
+}
